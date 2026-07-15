@@ -1,0 +1,348 @@
+/* ──────────────────────────────────────────────────────────
+   LMENG · app.js
+   Cards de status por plugue (com bateria), KPIs e timer.
+   ────────────────────────────────────────────────────────── */
+(function () {
+  // ── Configuracao ─────────────────────────────────────────
+  const REFRESH_MS = 30000;
+  const TICK_MS    = 1000;
+
+  // Locais de carregamento (PC145, PC146, PC147 — 1 plug cada)
+  const locations = [
+    { name: "PC145", key: "pc145" },
+    { name: "PC146", key: "pc146" },
+    { name: "PC147", key: "pc147" },
+  ];
+
+  const STATUS_LABEL = {
+    Available: "Disponível",
+    Preparing: "Preparando",
+    Charging:  "Carregando",
+    Finishing: "Finalizando",
+    Offline:   "Offline",
+  };
+
+  // ── Elementos ────────────────────────────────────────────
+  const $ = (sel) => document.querySelector(sel);
+  const root       = document.documentElement;
+  const elKpis     = $("#kpis");
+  const elLocs     = $("#locations");
+  const elUpdated  = $("#last-update");
+  const elLive     = $("#live-pill");
+  const elBanner   = $("#banner");
+  const elBtnTheme = $("#theme-toggle");
+
+  // ── Estado ───────────────────────────────────────────────
+  const allKeys = locations.map(l => l.key);
+  let data       = {};     // { key: [{ plug, status, online }, ...] }
+  let details    = {};     // { "key/plug": { percent, minutesTo80Percent, ... } }
+  let lastFetch  = 0;
+  let usingMock  = false;
+
+  // ── Utils ────────────────────────────────────────────────
+  function getStatus(ch) {
+    if (!ch || ch.online === 0) return "Offline";
+    return STATUS_LABEL[ch.status] ? ch.status : "Available";
+  }
+  function statusClass(ch) {
+    return "is-" + getStatus(ch).toLowerCase();
+  }
+  function paymentLink(key, plug) {
+    return `https://incharge.app/now/${String(key).toUpperCase()}/${plug}`;
+  }
+
+  // Mini DOM builder
+  function el(tag, attrs, ...children) {
+    const node = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs || {})) {
+      if (v == null || v === false) continue;
+      if (k === "class") node.className = v;
+      else if (k === "html") node.innerHTML = v;
+      else if (k === "style") node.setAttribute("style", v);
+      else if (k.startsWith("data-")) node.setAttribute(k, v);
+      else if (k in node) node[k] = v;
+      else node.setAttribute(k, v);
+    }
+    for (const c of children.flat()) {
+      if (c == null) continue;
+      node.append(c.nodeType ? c : document.createTextNode(String(c)));
+    }
+    return node;
+  }
+
+  // ── KPIs ─────────────────────────────────────────────────
+  function aggregate() {
+    const s = { total: 0, available: 0, charging: 0, finishing: 0, preparing: 0, offline: 0 };
+    allKeys.forEach(k => {
+      (data[k] || []).forEach(ch => {
+        s.total++;
+        const st = getStatus(ch).toLowerCase();
+        if (s[st] != null) s[st]++;
+      });
+    });
+    return s;
+  }
+
+  function renderKpis() {
+    const s = aggregate();
+    const items = [
+      { label: "Total",       value: s.total,     cls: "kpi--total"     },
+      { label: "Disponíveis", value: s.available,  cls: "kpi--available" },
+      { label: "Carregando",  value: s.charging,   cls: "kpi--charging"  },
+      { label: "Finalizando", value: s.finishing,  cls: "kpi--finishing" },
+      { label: "Offline",     value: s.offline,    cls: "kpi--offline"   },
+    ];
+    elKpis.replaceChildren(...items.map(it =>
+      el("div", { class: `kpi ${it.cls}` },
+        el("div", { class: "kpi__swatch" }),
+        el("div", { class: "kpi__body" },
+          el("span", { class: "kpi__label" }, it.label),
+          el("span", { class: "kpi__value" }, String(it.value)),
+        )
+      )
+    ));
+  }
+
+  // ── Card de status (principal, por plugue) ────────────────
+  // Mesmo tamanho para todos os status. Mostra % + barra so quando carregando.
+  function renderStatusCard(key, ch, detail) {
+    const status     = getStatus(ch);
+    const label      = STATUS_LABEL[status] || status;
+    const isCharging = status === "Charging";
+
+    const card = el("a", {
+      class: `status-card ${statusClass(ch)}`,
+      href: paymentLink(key, ch.plug),
+      target: "_blank",
+      rel: "noopener noreferrer",
+      title: `${key.toUpperCase()} · Plug ${ch.plug} — ${label}`,
+    });
+
+    const raw = detail && Number.isFinite(detail.percent) ? detail.percent : null;
+    const pct = raw == null ? null : Math.max(0, Math.min(100, Math.round(raw)));
+
+    card.append(
+      el("div", { class: "status-card__top" },
+        el("span", { class: "status-card__title" },
+          el("span", { class: "status-card__dot" }),
+          el("span", { class: "status-card__title-text" }, `${key.toUpperCase()} · ${label}`),
+        ),
+        isCharging ? el("span", { class: "status-card__pct" }, pct != null ? `${pct}%` : "…") : null,
+      ),
+      el("div", { class: "status-card__bar" },
+        el("span", { class: "status-card__fill", style: `width:${isCharging && pct != null ? pct : 0}%` }),
+      ),
+    );
+
+    return card;
+  }
+
+  function renderLoadingCard(name) {
+    return el("div", { class: "status-card is-loading" },
+      el("div", { class: "status-card__top" },
+        el("span", { class: "status-card__title" },
+          el("span", { class: "status-card__dot" }),
+          el("span", { class: "status-card__title-text" }, name || "—"),
+        ),
+      ),
+      el("div", { class: "status-card__bar" },
+        el("span", { class: "status-card__fill", style: "width:0%" }),
+      ),
+    );
+  }
+
+  // ── Render dos locais ─────────────────────────────────────
+  // Cada local tem apenas 1 plug.
+  function renderLocations() {
+    const frag = document.createDocumentFragment();
+
+    locations.forEach(loc => {
+      const list = data[loc.key] || [];
+      const col = el("div", { class: "charger-col" });
+
+      if (list.length === 0) {
+        col.append(renderLoadingCard(loc.name));
+      } else {
+        list.forEach(ch => col.append(renderStatusCard(loc.key, ch, details[`${loc.key}/${ch.plug}`])));
+      }
+
+      frag.append(col);
+    });
+
+    elLocs.replaceChildren(frag);
+  }
+
+  // ── Timer "ha Xs" ─────────────────────────────────────────
+  function fmtSince() {
+    if (!lastFetch) return "esperando dados…";
+    const s = Math.floor((Date.now() - lastFetch) / 1000);
+    if (s < 5)    return "agora";
+    if (s < 60)   return `há ${s}s`;
+    if (s < 3600) return `há ${Math.floor(s / 60)}min ${s % 60}s`;
+    return `há ${Math.floor(s / 3600)}h`;
+  }
+
+  function renderUpdated() {
+    elUpdated.textContent = fmtSince();
+    const stale = lastFetch && (Date.now() - lastFetch > REFRESH_MS * 2);
+    elLive.classList.toggle("is-stale", !!stale);
+    elLive.querySelector(".live-text").textContent = stale ? "PAUSADO" : "AO VIVO";
+  }
+
+  // ── Render all ───────────────────────────────────────────
+  function renderAll() {
+    renderKpis();
+    renderLocations();
+  }
+
+  // ── Fetch ────────────────────────────────────────────────
+  async function fetchOne(key) {
+    try {
+      const res = await fetch(`https://api.incharge.app/api/v2/now/${key}`, { cache: "no-store" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      const arr = Array.isArray(json) ? json : Array.isArray(json?.chargers) ? json.chargers : [];
+      return { key, data: arr, ok: true };
+    } catch (err) {
+      return { key, data: [], ok: false };
+    }
+  }
+
+  // Detalhe de um plug (bateria %) - endpoint /now/{key}/{plug}
+  async function fetchDetail(key, plug) {
+    try {
+      const res = await fetch(`https://api.incharge.app/api/v2/now/${key}/${plug}`, { cache: "no-store" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      const obj = Array.isArray(json) ? json[0] : json;
+      return { key, plug, detail: obj || null, ok: true };
+    } catch (err) {
+      return { key, plug, detail: null, ok: false };
+    }
+  }
+
+  // Busca o detalhe de todos os plugs que estao carregando
+  async function refreshDetails() {
+    const charging = [];
+    allKeys.forEach(k => {
+      (data[k] || []).forEach(ch => {
+        if (getStatus(ch) === "Charging") charging.push({ key: k, plug: ch.plug });
+      });
+    });
+    if (charging.length === 0) { details = {}; return; }
+
+    const results = await Promise.all(charging.map(p => fetchDetail(p.key, p.plug)));
+    const next = {};
+    results.forEach(r => { if (r.ok && r.detail) next[`${r.key}/${r.plug}`] = r.detail; });
+    details = next;
+  }
+
+  async function refresh() {
+    try {
+      const results = await Promise.all(allKeys.map(fetchOne));
+      const okCount = results.filter(r => r.ok).length;
+
+      if (okCount === 0) {
+        if (!usingMock) {
+          usingMock = true;
+          applyMock();
+          showBanner("Visualizando com dados de exemplo - a API real esta bloqueada por CORS neste preview.");
+        } else {
+          applyMock();
+        }
+      } else {
+        usingMock = false;
+        const next = {};
+        results.forEach(r => { next[r.key] = r.data; });
+        data = next;
+        lastFetch = Date.now();
+        hideBanner();
+        await refreshDetails();
+      }
+
+      renderAll();
+      renderUpdated();
+    } catch (e) {
+      console.error("[LMENG] refresh falhou", e);
+    }
+  }
+
+  // ── Mock data (fallback CORS) ─────────────────────────────
+  // 1 plug por local.
+  function applyMock() {
+    const statuses = ["Available", "Available", "Available", "Charging", "Charging", "Finishing", "Preparing"];
+    const pick = () => statuses[Math.floor(Math.random() * statuses.length)];
+    const next = {};
+    allKeys.forEach((key, idx) => {
+      const goOffline = idx % 9 === 0;
+      next[key] = [{
+        plug: 1,
+        status: pick(),
+        online: goOffline ? 0 : 1,
+      }];
+    });
+    data = next;
+
+    // Detalhes de exemplo (bateria %) para os plugs carregando
+    const det = {};
+    allKeys.forEach(key => {
+      (next[key] || []).forEach(ch => {
+        if (ch.online !== 0 && ch.status === "Charging") {
+          const k = `${key}/${ch.plug}`;
+          const prev = details[k] && Number.isFinite(details[k].percent) ? details[k].percent : 35 + Math.floor(Math.random() * 40);
+          const percent = Math.min(100, prev + Math.floor(Math.random() * 4));
+          det[k] = {
+            percent,
+            minutesTo80Percent: Math.max(0, Math.round((80 - percent) / 3)),
+            minutesConnected: 5 + Math.floor(Math.random() * 40),
+            status: "Charging",
+          };
+        }
+      });
+    });
+    details = det;
+    lastFetch = Date.now();
+  }
+
+  function showBanner(msg) {
+    if (!elBanner) return;
+    elBanner.textContent = "";
+    elBanner.append(
+      el("span", { class: "banner__dot" }),
+      el("span", null, msg),
+    );
+    elBanner.style.display = "flex";
+  }
+  function hideBanner() { if (elBanner) elBanner.style.display = "none"; }
+
+  // ── Tema ─────────────────────────────────────────────────
+  function applyTheme(theme) {
+    root.setAttribute("data-theme", theme);
+    try { localStorage.setItem("lmeng.theme", theme); } catch (_) {}
+  }
+  function initTheme() {
+    let saved = null;
+    try { saved = localStorage.getItem("lmeng.theme"); } catch (_) {}
+    if (saved === "light" || saved === "dark") applyTheme(saved);
+    elBtnTheme && elBtnTheme.addEventListener("click", () => {
+      applyTheme(root.getAttribute("data-theme") === "dark" ? "light" : "dark");
+    });
+  }
+
+  // ── Boot ─────────────────────────────────────────────────
+  function boot() {
+    initTheme();
+    renderAll();
+    refresh();
+    setInterval(refresh, REFRESH_MS);
+    setInterval(renderUpdated, TICK_MS);
+
+    window.__lmeng = { refresh, renderAll };
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", boot);
+  } else {
+    boot();
+  }
+})();
